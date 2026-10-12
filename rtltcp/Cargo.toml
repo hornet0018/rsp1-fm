@@ -1,0 +1,12 @@
+[package]
+name = "rsp1-rtltcp"
+version = "0.1.0"
+edition = "2021"
+description = "SDRplay RSP1 の IQ を RTL-TCP で配信するブリッジ (SDR# の RTL-SDR (TCP) 用)"
+
+[[bin]]
+name = "rsp1-rtltcp"
+path = "src/main.rs"
+
+[dependencies]
+rsp1fm-core = { path = "../core" }

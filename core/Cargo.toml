@@ -1,0 +1,8 @@
+[package]
+name = "rsp1fm-core"
+version = "0.1.0"
+edition = "2021"
+description = "SDRplay RSP1 の IQ を取り込むコア (SDRplay API 3.x への FFI)"
+
+[dependencies]
+libloading = "0.8"
