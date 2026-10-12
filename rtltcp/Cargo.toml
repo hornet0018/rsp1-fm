@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 rsp1fm-core = { path = "../core" }
+ctrlc = "3"

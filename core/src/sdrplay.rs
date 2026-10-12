@@ -338,14 +338,31 @@ macro_rules! sym {
 }
 
 impl Api {
-    /// sdrplay_api.dll を探してロードする。
+    /// SDRplay API ライブラリ (sdrplay_api.dll / libsdrplay_api.so) を探してロードする。
     pub fn load() -> Result<Api, String> {
         let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(p) = std::env::var("SDRPLAY_API_DLL") {
-            candidates.push(PathBuf::from(p));
+        // 環境変数 (Windows/Linux 共通。旧名 SDRPLAY_API_DLL も受け付ける)
+        for var in ["SDRPLAY_API_LIB", "SDRPLAY_API_DLL"] {
+            if let Ok(p) = std::env::var(var) {
+                if !p.is_empty() {
+                    candidates.push(PathBuf::from(p));
+                }
+            }
         }
-        candidates.push(PathBuf::from(r"C:\Program Files\SDRplay\API\x64\sdrplay_api.dll"));
-        candidates.push(PathBuf::from("sdrplay_api.dll"));
+        #[cfg(windows)]
+        {
+            candidates.push(PathBuf::from(
+                r"C:\Program Files\SDRplay\API\x64\sdrplay_api.dll",
+            ));
+            candidates.push(PathBuf::from("sdrplay_api.dll"));
+        }
+        #[cfg(not(windows))]
+        {
+            // SDRplay の Linux インストーラは既定で /usr/local/lib に入れ ldconfig する。
+            candidates.push(PathBuf::from("/usr/local/lib/libsdrplay_api.so"));
+            candidates.push(PathBuf::from("/usr/lib/libsdrplay_api.so"));
+            candidates.push(PathBuf::from("libsdrplay_api.so"));
+        }
 
         let mut last_err = String::new();
         for path in candidates {
@@ -382,7 +399,7 @@ impl Api {
             }
         }
         Err(format!(
-            "sdrplay_api.dll を読み込めませんでした。SDRplay API をインストールしてください。({last_err})"
+            "SDRplay API ライブラリを読み込めませんでした。SDRplay API をインストールしてください。({last_err})"
         ))
     }
 

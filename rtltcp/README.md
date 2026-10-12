@@ -13,34 +13,39 @@ RSP1 ──(SDRplay API, 2MHz ゼロIF)──▶ rsp1-rtltcp ──(RTL-TCP / CU
 
 ## ビルド
 
-```powershell
-cd E:\github\rsp1-fm
+Windows / Linux 共通（Rust stable）:
+
+```bash
+cd rsp1-fm
 cargo build --release -p rsp1-rtltcp
-# -> target\release\rsp1-rtltcp.exe
+# -> target/release/rsp1-rtltcp      (Linux)
+# -> target\release\rsp1-rtltcp.exe  (Windows)
 ```
 
-> 低整合性ラベルが継承されるフォルダでは `target` に書き込めないことがあります。
+> 低整合性ラベルが継承されるフォルダ（Windows）では `target` に書き込めないことがあります。
 > その場合は書き込み可能な場所を `CARGO_TARGET_DIR` に指定してください:
 > ```powershell
 > $env:CARGO_TARGET_DIR='E:\path\to\rtltcp-target'
 > cargo build --release -p rsp1-rtltcp
-> # -> E:\path\to\rtltcp-target\release\rsp1-rtltcp.exe
 > ```
 
 ## 実行
 
-```powershell
-# いちばん簡単（低整合性ラベルの影響を避けてコピー実行。後述の「低整合性」を参照）
-rtltcp\tools\run-rtltcp.cmd --freq 80.0
-
+```bash
 # 既定 (127.0.0.1:1234, 100 MHz, 2048000 Hz, AGC)
-.\target\release\rsp1-rtltcp.exe
+./target/release/rsp1-rtltcp
 
 # 例: JR-D 下り帯を 2.048MHz で
-.\target\release\rsp1-rtltcp.exe --freq 352.603125 --rate 2048000
+./target/release/rsp1-rtltcp --freq 352.603125 --rate 2048000
 
 # デバイス一覧だけ
-.\target\release\rsp1-rtltcp.exe --list
+./target/release/rsp1-rtltcp --list
+```
+
+Windows では低整合性ラベルの影響を避けるランチャーが使えます:
+
+```powershell
+rtltcp\tools\run-rtltcp.cmd --freq 80.0
 ```
 
 SDR# 側:
@@ -48,6 +53,44 @@ SDR# 側:
 - Source = **RTL-SDR (TCP)**
 - Host = `127.0.0.1` / Port = `1234`
 - SDR# が接続時に周波数・サンプルレート・ゲインを送ってくるので、それに追従します。
+
+## Linux (Ubuntu) での実行
+
+SDRplay API 3.x は Linux 版も提供されています（同じ `sdrplay_api_*` 関数）。Ubuntu では次を用意します。
+
+1. **SDRplay API 3.x のインストール**
+   - [SDRplay 公式](https://www.sdrplay.com/downloads/) の Linux 版 API を入手してインストール
+     （`SDRplay_RSP_API-Linux-*.run` を実行）。既定では `/usr/local/lib/libsdrplay_api.so`
+     が入り、`ldconfig` されるのでそのままロードできます。
+2. **API サービスの起動**
+   ```bash
+   sudo systemctl status sdrplay      # 動いていなければ start/enable
+   sudo systemctl start sdrplay
+   ```
+3. **udev ルール**（インストーラが設定します）で RSP1 を一般ユーザーから使えるようにする。
+   反映されない場合は再ログイン、または:
+   ```bash
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+4. **ビルドと実行**
+   ```bash
+   cd rsp1-fm
+   cargo build --release -p rsp1-rtltcp
+   ./target/release/rsp1-rtltcp --freq 80.0
+   ```
+5. **動作確認**（SDR# の代わり）:
+   ```bash
+   python3 rtltcp/tools/rtltcp_check.py --freq 80.0 --rate 2048000 --seconds 2 --agc
+   ```
+
+ライブラリの場所が違う場合は環境変数で指定できます:
+
+```bash
+SDRPLAY_API_LIB=/path/to/libsdrplay_api.so ./target/release/rsp1-rtltcp
+```
+
+> 終了は `Ctrl+C`。SDRplay を uninit / release / close してから終了します。
+> Linux では整合性ラベル（低整合性）の概念はないため、その警告は出ません。
 
 ## オプション
 
@@ -63,7 +106,7 @@ SDR# 側:
 | `--release-on-idle` | | クライアント切断時に RSP1 を解放（SDRuno と交互に使う場合） |
 | `--list` | | 接続中の RSP を一覧表示して終了 |
 
-## 重要: 低整合性 (Low Integrity) で起動すると必ず失敗します
+## 重要 (Windows のみ): 低整合性 (Low Integrity) で起動すると必ず失敗します
 
 SDRplay API サービスは **中整合性 (Medium Integrity)** の共有メモリ
 `Global\sdrSrvComShMem` でクライアントと通信します。Windows の整合性ラベル規則により、
@@ -114,8 +157,8 @@ icacls <exe>     # "Mandatory Label\Low Mandatory Level" が出たら該当
 
 同梱の確認クライアントで、SDR# 無しでも検証できます。
 
-```powershell
-python rtltcp\tools\rtltcp_check.py --freq 80.0 --rate 2048000 --seconds 2 --agc
+```bash
+python3 rtltcp/tools/rtltcp_check.py --freq 80.0 --rate 2048000 --seconds 2 --agc
 ```
 
 ヘッダ（`RTL0`, tuner, ゲイン表）・コマンド・IQ の流量とスペクトルを表示します。
@@ -123,12 +166,12 @@ python rtltcp\tools\rtltcp_check.py --freq 80.0 --rate 2048000 --seconds 2 --agc
 実測例（RSP1 互換機 / 80 MHz）: `RTL0`, tuner=5, gain_count=29、
 2048000 Hz で定常受信、ノイズフロア約 -97 dB、信号ピーク約 -61 dB。
 
-診断ツール:
+診断ツール（Windows 専用のものは Linux 版に置き換え）:
 
 | ツール | 用途 |
 |---|---|
-| `tools\run-rtltcp.cmd` | 低整合性ラベルを避けて exe をコピー実行するランチャー |
-| `tools\sdrplay_api_probe.py` | API のバージョンと Open の成否・GetLastError を表示 |
-| `tools\sdrplay_deep_probe.py` | プロセス整合性と共有メモリのアクセス権を表示 |
-| `core\examples\api_probe.rs` | Rust 側から Open と GetLastError を表示 |
-| `core\examples\raw_load_probe.rs` | LoadLibraryW 直呼びでトークンとマッピングを確認 |
+| `tools\run-rtltcp.cmd` | (Windows) 低整合性ラベルを避けて exe をコピー実行するランチャー |
+| `tools/sdrplay_api_probe.py` | (Windows) API のバージョンと Open の成否・GetLastError を表示 |
+| `tools/sdrplay_deep_probe.py` | (Windows) プロセス整合性と共有メモリのアクセス権を表示 |
+| `core/examples/api_probe.rs` | (Windows) Rust 側から Open と GetLastError を表示 |
+| `core/examples/raw_load_probe.rs` | (Windows) LoadLibraryW 直呼びでトークンとマッピングを確認 |

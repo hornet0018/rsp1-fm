@@ -491,8 +491,16 @@ impl Radio {
                         );
                         eprintln!(
                             "[rsp1] SDRplay API サービスは、直前まで使っていたクライアントの解放に\
-                             時間がかかることがあります (数十秒〜1分)。自動で再試行します。\
-                             改善しない場合は C:\\Program Files\\SDRplay\\RestartService.bat で\
+                             時間がかかることがあります (数十秒〜1分)。自動で再試行します。"
+                        );
+                        #[cfg(windows)]
+                        eprintln!(
+                            "[rsp1] 改善しない場合は C:\\Program Files\\SDRplay\\RestartService.bat で\
+                             サービスを再起動してください。"
+                        );
+                        #[cfg(not(windows))]
+                        eprintln!(
+                            "[rsp1] 改善しない場合は `sudo systemctl restart sdrplay` などで\
                              サービスを再起動してください。"
                         );
                     }
@@ -680,117 +688,115 @@ fn open_stream(
     }
 }
 
-/// Ctrl+C / ウィンドウを閉じたときに、SDRplay をきちんと閉じてから終了するための送り先。
-static CMD_TX: Mutex<Option<Sender<Cmd>>> = Mutex::new(None);
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn SetConsoleCtrlHandler(
-        handler: Option<unsafe extern "system" fn(u32) -> i32>,
-        add: i32,
-    ) -> i32;
-}
-
-/// CTRL_C_EVENT(0) / CTRL_CLOSE_EVENT(2) でラジオ側に後始末をさせてから終了する。
-// ---- 低整合性 (Low Integrity) の検出 ----
+// ---- 終了シグナル (Ctrl+C / ウィンドウを閉じる) ----
 //
-// サンドボックス環境 (DSH など) が exe に "Mandatory Label\Low" を付けると、
-// その exe から起動したプロセスは低整合性 (Low Integrity) になる。
-// SDRplay API サービスは Global\sdrSrvComShMem (中整合性) の共有メモリを開くため、
-// 低整合性では必ず sdrplay_api_Open が "Could not open file mapping object" で失敗する。
-const TOKEN_QUERY: u32 = 0x0008;
-const TOKEN_INTEGRITY_LEVEL: u32 = 25;
-const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
-
-#[repr(C)]
-struct SidAndAttributes {
-    sid: *mut c_void,
-    attributes: u32,
-}
-
-#[repr(C)]
-struct TokenMandatoryLabel {
-    label: SidAndAttributes,
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn OpenProcessToken(h: *mut c_void, access: u32, tok: *mut *mut c_void) -> i32;
-    fn GetTokenInformation(
-        tok: *mut c_void,
-        class: u32,
-        buf: *mut c_void,
-        len: u32,
-        ret: *mut u32,
-    ) -> i32;
-    fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
-    fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
-}
-
-/// 現在のプロセスの整合性レベル (RID)。取得できなければ None。
-fn integrity_rid() -> Option<u32> {
-    unsafe {
-        let mut tok: *mut c_void = std::ptr::null_mut();
-        // GetCurrentProcess() は常に疑似ハンドル (-1)。
-        if OpenProcessToken(-1isize as *mut c_void, TOKEN_QUERY, &mut tok) == 0 {
-            return None;
-        }
-        let mut size = 0u32;
-        GetTokenInformation(tok, TOKEN_INTEGRITY_LEVEL, std::ptr::null_mut(), 0, &mut size);
-        if size == 0 {
-            return None;
-        }
-        let mut buf = vec![0u8; size as usize];
-        if GetTokenInformation(
-            tok,
-            TOKEN_INTEGRITY_LEVEL,
-            buf.as_mut_ptr() as *mut c_void,
-            size,
-            &mut size,
-        ) == 0
-        {
-            return None;
-        }
-        let tml = &*(buf.as_ptr() as *const TokenMandatoryLabel);
-        let cnt = *GetSidSubAuthorityCount(tml.label.sid);
-        if cnt == 0 {
-            return None;
-        }
-        Some(*GetSidSubAuthority(tml.label.sid, (cnt as u32) - 1))
-    }
-}
-
-/// 低整合性で起動していると SDRplay API は絶対に開けないので、先に警告する。
-fn warn_if_low_integrity() {
-    if let Some(rid) = integrity_rid() {
-        if rid < SECURITY_MANDATORY_MEDIUM_RID {
-            eprintln!(
-                "[警告] このプロセスは低整合性 (Low Integrity, RID {rid:#x}) で動作しています。"
-            );
-            eprintln!(
-                "       SDRplay API は中整合性の共有メモリ (Global\\sdrSrvComShMem) を使うため、"
-            );
-            eprintln!("       この状態では sdrplay_api_Open が必ず失敗します。対処:");
-            eprintln!("        1) 通常のターミナル (サンドボックス外) から実行する");
-            eprintln!("        2) exe を別フォルダへコピーしてから実行する (tools\\run-rtltcp.cmd)");
-            eprintln!("        3) 管理者権限で: icacls \"<exe>\" /setintegritylevel Medium");
-        }
-    }
-}
-
-unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
-    if ctrl_type == 0 || ctrl_type == 2 {
+// SDRplay をきちんと uninit / release / close してから終了するため、シグナルを
+// 受けたらラジオスレッドに Cmd::Quit を送り、後始末の完了を待ってから終了する。
+// ctrlc クレートで Windows (ConsoleCtrlHandler) と Unix (SIGINT/SIGTERM) の両方を扱う。
+fn install_ctrl_handler(cmd_tx: Sender<Cmd>) {
+    let _ = ctrlc::set_handler(move || {
         println!("\n[main] 終了します。RSP1 を解放しています...");
-        if let Ok(g) = CMD_TX.lock() {
-            if let Some(tx) = g.as_ref() {
-                let _ = tx.send(Cmd::Quit);
-            }
-        }
+        let _ = cmd_tx.send(Cmd::Quit);
         // ラジオスレッドが uninit / release / close を終えるのを待つ
         std::thread::sleep(std::time::Duration::from_millis(900));
         std::process::exit(0);
+    });
+}
+
+// ---- 低整合性 (Low Integrity) の検出 (Windows のみ) ----
+#[cfg(windows)]
+mod integrity {
+    use std::ffi::c_void;
+
+    // サンドボックス環境 (DSH など) が exe に "Mandatory Label\Low" を付けると、
+    // その exe から起動したプロセスは低整合性 (Low Integrity) になる。
+    // SDRplay API サービスは Global\sdrSrvComShMem (中整合性) の共有メモリを開くため、
+    // 低整合性では必ず sdrplay_api_Open が "Could not open file mapping object" で失敗する。
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_INTEGRITY_LEVEL: u32 = 25;
+    pub const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
     }
-    0
+
+    #[repr(C)]
+    struct TokenMandatoryLabel {
+        label: SidAndAttributes,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(h: *mut c_void, access: u32, tok: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            tok: *mut c_void,
+            class: u32,
+            buf: *mut c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+        fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
+        fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
+    }
+
+    /// 現在のプロセスの整合性レベル (RID)。取得できなければ None。
+    pub fn integrity_rid() -> Option<u32> {
+        unsafe {
+            let mut tok: *mut c_void = std::ptr::null_mut();
+            // GetCurrentProcess() は常に疑似ハンドル (-1)。
+            if OpenProcessToken(-1isize as *mut c_void, TOKEN_QUERY, &mut tok) == 0 {
+                return None;
+            }
+            let mut size = 0u32;
+            GetTokenInformation(tok, TOKEN_INTEGRITY_LEVEL, std::ptr::null_mut(), 0, &mut size);
+            if size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            if GetTokenInformation(
+                tok,
+                TOKEN_INTEGRITY_LEVEL,
+                buf.as_mut_ptr() as *mut c_void,
+                size,
+                &mut size,
+            ) == 0
+            {
+                return None;
+            }
+            let tml = &*(buf.as_ptr() as *const TokenMandatoryLabel);
+            let cnt = *GetSidSubAuthorityCount(tml.label.sid);
+            if cnt == 0 {
+                return None;
+            }
+            Some(*GetSidSubAuthority(tml.label.sid, (cnt as u32) - 1))
+        }
+    }
+
+    /// 低整合性で起動していると SDRplay API は絶対に開けないので、先に警告する。
+    pub fn warn_if_low_integrity() {
+        if let Some(rid) = integrity_rid() {
+            if rid < SECURITY_MANDATORY_MEDIUM_RID {
+                eprintln!(
+                    "[警告] このプロセスは低整合性 (Low Integrity, RID {rid:#x}) で動作しています。"
+                );
+                eprintln!(
+                    "       SDRplay API は中整合性の共有メモリ (Global\\sdrSrvComShMem) を使うため、"
+                );
+                eprintln!("       この状態では sdrplay_api_Open が必ず失敗します。対処:");
+                eprintln!("        1) 通常のターミナル (サンドボックス外) から実行する");
+                eprintln!("        2) exe を別フォルダへコピーしてから実行する (tools\\run-rtltcp.cmd)");
+                eprintln!("        3) 管理者権限で: icacls \"<exe>\" /setintegritylevel Medium");
+            }
+        }
+    }
+}
+
+// Linux では整合性ラベルの概念がないため何もしない。
+#[cfg(not(windows))]
+mod integrity {
+    pub fn warn_if_low_integrity() {}
 }
 
 fn radio_thread(rx: Receiver<Cmd>, state: Arc<StreamState>, release_on_idle: bool) {
@@ -816,8 +822,16 @@ fn radio_thread(rx: Receiver<Cmd>, state: Arc<StreamState>, release_on_idle: boo
 // ---- デバイス一覧 ----
 
 fn list_devices() {
-    match integrity_rid() {
-        Some(rid) => println!("プロセス整合性: RID {rid:#x}{}", if rid < SECURITY_MANDATORY_MEDIUM_RID { " (低整合性 → SDRplay API は開けません)" } else { "" }),
+    #[cfg(windows)]
+    match integrity::integrity_rid() {
+        Some(rid) => println!(
+            "プロセス整合性: RID {rid:#x}{}",
+            if rid < integrity::SECURITY_MANDATORY_MEDIUM_RID {
+                " (低整合性 → SDRplay API は開けません)"
+            } else {
+                ""
+            }
+        ),
         None => println!("プロセス整合性: 取得できません"),
     }
     let api = match Api::load() {
@@ -1056,7 +1070,7 @@ fn handle_client(mut sock: TcpStream, state: Arc<StreamState>, cmd_tx: Sender<Cm
 }
 
 fn main() {
-    warn_if_low_integrity();
+    integrity::warn_if_low_integrity();
     let cfg = match Config::parse(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(e) => {
@@ -1072,13 +1086,8 @@ fn main() {
     let state = Arc::new(StreamState { sink: Mutex::new(None) });
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let release_on_idle = cfg.release_on_idle;
-    if let Ok(mut g) = CMD_TX.lock() {
-        *g = Some(cmd_tx.clone());
-    }
-    unsafe {
-        // Ctrl+C / ウィンドウを閉じたときに RSP1 を解放してから終了する
-        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
-    }
+    // Ctrl+C / ウィンドウを閉じたときに RSP1 を解放してから終了する
+    install_ctrl_handler(cmd_tx.clone());
     {
         let state = state.clone();
         if let Err(e) = std::thread::Builder::new()
